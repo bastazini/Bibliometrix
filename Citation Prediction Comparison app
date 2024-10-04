@@ -1,0 +1,127 @@
+# Install necessary packages if needed
+# install.packages("shiny")
+# install.packages("ggplot2")
+# install.packages("scholar")
+# install.packages("minpack.lm")
+
+# Load libraries
+library(shiny)
+library(ggplot2)
+library(scholar)
+library(minpack.lm)  # For non-linear models
+
+# Define the UI
+ui <- fluidPage(
+  titlePanel("Citation Prediction Comparison"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      numericInput("num_researchers", "Number of Researchers to Compare", value = 2, min = 1, max = 5),
+      uiOutput("scholar_input_ui"),
+      sliderInput("year_range", "Year Range for Citation Analysis", 
+                  min = 1990, max = as.numeric(format(Sys.Date(), "%Y")), 
+                  value = c(2000, as.numeric(format(Sys.Date(), "%Y")))),
+      actionButton("analyze", "Analyze")
+    ),
+    
+    mainPanel(
+      plotOutput("citationPlot"),
+      verbatimTextOutput("model_info")
+    )
+  )
+)
+
+# Define the server logic
+server <- function(input, output, session) {
+  
+  # Dynamically create input fields for Google Scholar IDs based on the number of researchers
+  output$scholar_input_ui <- renderUI({
+    lapply(1:input$num_researchers, function(i) {
+      textInput(paste0("scholar_id_", i), paste("Google Scholar ID for Researcher", i))
+    })
+  })
+  
+  # Function to fit models, calculate AIC, select the best model, and predict citations
+  fit_and_predict <- function(scholar_id, researcher_name, year_range) {
+    # Get citation history
+    citations <- get_citation_history(scholar_id)
+    citations <- citations[citations$year >= year_range[1] & citations$year <= year_range[2], ]
+    
+    # Fit the models
+    linear_model <- lm(cites ~ year, data = citations)
+    exp_model <- nlsLM(cites ~ a * exp(b * (year - min(citations$year))), 
+                       data = citations, start = list(a = 1, b = 0.1))
+    asymptotic_model <- nlsLM(cites ~ a * (1 - exp(-b * (year - min(citations$year)))), 
+                              data = citations, start = list(a = max(citations$cites), b = 0.1))
+    
+    # Calculate AIC for each model
+    aic_values <- c(AIC(linear_model), AIC(exp_model), AIC(asymptotic_model))
+    model_names <- c("Linear", "Exponential", "Asymptotic")
+    
+    # Select the best model
+    best_model_idx <- which.min(aic_values)
+    best_model_name <- model_names[best_model_idx]
+    best_model <- list(linear_model, exp_model, asymptotic_model)[[best_model_idx]]
+    
+    # Create future year data for prediction (next 10 years)
+    future_years <- data.frame(year = seq(max(citations$year) + 1, max(citations$year) + 10))
+    
+    # Predict future citations based on the best model
+    future_citations <- predict(best_model, newdata = future_years)
+    
+    # Combine actual and predicted data
+    citations$source <- "actual"
+    future_years$cites <- future_citations
+    future_years$source <- "predicted"
+    combined_data <- rbind(citations, future_years)
+    
+    # Add researcher name and best model to the data
+    combined_data$researcher <- paste0(researcher_name, " (Best Model: ", best_model_name, ")")
+    
+    # Return combined data and model information
+    list(combined_data = combined_data, best_model_name = best_model_name)
+  }
+  
+  # Create a reactive event for the "Analyze" button
+  observeEvent(input$analyze, {
+    
+    # Get the scholar IDs and researcher names dynamically
+    scholar_ids <- sapply(1:input$num_researchers, function(i) input[[paste0("scholar_id_", i)]])
+    researcher_names <- paste("Researcher", 1:input$num_researchers)
+    
+    # Get the year range
+    year_range <- input$year_range
+    
+    # Apply the fit_and_predict function to each researcher
+    results <- lapply(1:input$num_researchers, function(i) {
+      fit_and_predict(scholar_ids[i], researcher_names[i], year_range)
+    })
+    
+    # Combine data for plotting
+    all_data <- do.call(rbind, lapply(results, function(res) res$combined_data))
+    
+    # Render the plot
+    output$citationPlot <- renderPlot({
+      ggplot(all_data, aes(x = year, y = cites, color = source, linetype = researcher)) +
+        geom_line(size = 1) +
+        geom_point() +
+        theme_minimal() +
+        labs(title = "Citation Prediction Comparison for Multiple Researchers",
+             x = "Year",
+             y = "Number of Citations") +
+        theme(legend.title = element_blank()) +
+        facet_wrap(~ researcher, scales = "free_y") +
+        theme(legend.position = "bottom")
+    })
+    
+    # Display the best model information
+    output$model_info <- renderPrint({
+      sapply(1:input$num_researchers, function(i) {
+        paste("Best model for", researcher_names[i], ":", results[[i]]$best_model_name)
+      })
+    })
+  })
+}
+
+# Run the application 
+shinyApp(ui = ui, server = server)
