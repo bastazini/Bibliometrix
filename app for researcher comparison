@@ -1,0 +1,173 @@
+# Install and Load Required Packages
+if(!require(shiny)) install.packages("shiny")
+if(!require(ggplot2)) install.packages("ggplot2")
+if(!require(scholar)) install.packages("scholar")
+if(!require(minpack.lm)) install.packages("minpack.lm")
+if(!require(dplyr)) install.packages("dplyr")
+
+library(shiny)
+library(ggplot2)
+library(scholar)
+library(minpack.lm)
+library(dplyr)
+
+# Function to fit models, calculate AIC, select the best model, and predict citations
+fit_and_predict <- function(scholar_id, researcher_name, year_range) {
+  citations <- get_citation_history(scholar_id)
+  citations <- citations[citations$year >= year_range[1] & citations$year <= year_range[2], ]
+  
+  linear_model <- lm(cites ~ year, data = citations)
+  exp_model <- nlsLM(cites ~ a * exp(b * (year - min(citations$year))), 
+                     data = citations, start = list(a = 1, b = 0.1))
+  asymptotic_model <- nlsLM(cites ~ a * (1 - exp(-b * (year - min(citations$year)))), 
+                            data = citations, start = list(a = max(citations$cites), b = 0.1))
+  
+  aic_values <- c(AIC(linear_model), AIC(exp_model), AIC(asymptotic_model))
+  model_names <- c("Linear", "Exponential", "Asymptotic")
+  best_model_idx <- which.min(aic_values)
+  best_model_name <- model_names[best_model_idx]
+  best_model <- list(linear_model, exp_model, asymptotic_model)[[best_model_idx]]
+  
+  future_years <- data.frame(year = seq(max(citations$year) + 1, max(citations$year) + 10))
+  future_citations <- predict(best_model, newdata = future_years)
+  
+  citations$source <- "actual"
+  future_years$cites <- future_citations
+  future_years$source <- "predicted"
+  combined_data <- rbind(citations, future_years)
+  
+  combined_data$researcher <- paste0(researcher_name, " (Best Model: ", best_model_name, ")")
+  
+  return(list(combined_data = combined_data, best_model_name = best_model_name))
+}
+
+# Function to Get Researcher Data (Metrics)
+get_researcher_data <- function(scholar_id) {
+  tryCatch({
+    profile <- get_profile(scholar_id)
+    pubs <- get_publications(scholar_id)
+    
+    if (is.null(profile) || is.null(pubs) || nrow(pubs) == 0) {
+      stop("No data found for this Google Scholar ID.")
+    }
+    
+    total_papers <- nrow(pubs)
+    total_citations <- sum(pubs$cites, na.rm = TRUE)
+    h_index <- profile$h_index
+    research_diversity <- length(unique(pubs$journal))
+    
+    result <- list(
+      Total_Papers = total_papers,
+      Total_Citations = total_citations,
+      H_Index = h_index,
+      Research_Diversity = research_diversity
+    )
+    
+    return(result)
+  }, error = function(e) {
+    message(paste("Error retrieving data for Google Scholar ID:", scholar_id))
+    message(e)
+    return(NULL)
+  })
+}
+
+# Function to calculate percentiles for each researcher
+calculate_percentile <- function(metrics_df, metric_name) {
+  sapply(1:nrow(metrics_df), function(i) {
+    value <- metrics_df[[metric_name]][i]
+    sum(metrics_df[[metric_name]] <= value) / nrow(metrics_df) * 100
+  })
+}
+
+# Shiny UI
+ui <- fluidPage(
+  titlePanel("Researcher Citation and Metrics Analysis"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      numericInput("num_researchers", "Number of Researchers to Compare", value = 2, min = 1, max = 5),
+      uiOutput("scholar_input_ui"),
+      sliderInput("year_range", "Year Range for Citation Analysis", 
+                  min = 1990, max = as.numeric(format(Sys.Date(), "%Y")), 
+                  value = c(2000, as.numeric(format(Sys.Date(), "%Y")))),
+      actionButton("analyze_citation", "Analyze Citation Prediction and Metrics")
+    ),
+    
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Citation Plot", plotOutput("citationPlot")),
+        tabPanel("Best Model Info", verbatimTextOutput("model_info")),
+        tabPanel("Metrics Table", tableOutput("metricsTable")),
+        tabPanel("Metrics Percentiles", tableOutput("percentileTable"))
+      )
+    )
+  )
+)
+
+# Shiny Server
+server <- function(input, output, session) {
+  
+  # Dynamically create scholar ID input fields based on the number of researchers
+  output$scholar_input_ui <- renderUI({
+    lapply(1:input$num_researchers, function(i) {
+      textInput(paste0("scholar_id_", i), paste("Google Scholar ID for Researcher", i))
+    })
+  })
+  
+  # Analyze Citation Prediction and Metrics
+  observeEvent(input$analyze_citation, {
+    scholar_ids <- sapply(1:input$num_researchers, function(i) input[[paste0("scholar_id_", i)]])
+    researcher_names <- paste("Researcher", 1:input$num_researchers)
+    year_range <- input$year_range
+    
+    # Citation Prediction
+    results <- lapply(1:input$num_researchers, function(i) {
+      fit_and_predict(scholar_ids[i], researcher_names[i], year_range)
+    })
+    
+    all_data <- do.call(rbind, lapply(results, function(res) res$combined_data))
+    
+    output$citationPlot <- renderPlot({
+      ggplot(all_data, aes(x = year, y = cites, color = source, linetype = researcher)) +
+        geom_line(size = 1) +
+        geom_point() +
+        theme_minimal() +
+        labs(title = "Citation Prediction Comparison for Multiple Researchers",
+             x = "Year", y = "Number of Citations") +
+        theme(legend.title = element_blank()) +
+        facet_wrap(~ researcher, scales = "free_y") +
+        theme(legend.position = "bottom")
+    })
+    
+    output$model_info <- renderPrint({
+      sapply(1:input$num_researchers, function(i) {
+        paste("Best model for", researcher_names[i], ":", results[[i]]$best_model_name)
+      })
+    })
+    
+    # Metrics Calculation for All Researchers
+    metrics_list <- lapply(scholar_ids, get_researcher_data)
+    metrics_df <- do.call(rbind, lapply(metrics_list, as.data.frame))
+    
+    output$metricsTable <- renderTable({
+      metrics_df
+    })
+    
+    # Percentile Calculation for each researcher and each metric
+    output$percentileTable <- renderTable({
+      metric_names <- c("Total_Papers", "Total_Citations", "H_Index", "Research_Diversity")
+      percentiles <- lapply(metric_names, function(metric) {
+        calculate_percentile(metrics_df, metric)
+      })
+      
+      percentile_df <- as.data.frame(do.call(cbind, percentiles))
+      colnames(percentile_df) <- metric_names
+      rownames(percentile_df) <- paste("Researcher", 1:nrow(metrics_df))
+      
+      return(percentile_df)
+    })
+  })
+}
+
+# Run the application 
+shinyApp(ui = ui, server = server)
